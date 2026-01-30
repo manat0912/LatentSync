@@ -51,12 +51,14 @@ class ImageProcessor:
         else:
             self.face_detector = FaceDetector(device=device)
 
-    def affine_transform(self, image: torch.Tensor) -> np.ndarray:
+    def affine_transform(self, image: torch.Tensor, raise_on_no_face: bool = False) -> np.ndarray:
         if self.face_detector is None:
             raise NotImplementedError("Using the CPU for face detection is not supported")
         bbox, landmark_2d_106 = self.face_detector(image)
         if bbox is None:
-            raise RuntimeError("Face not detected")
+            if raise_on_no_face:
+                raise RuntimeError("Face not detected")
+            return None, None, None
 
         pt_left_eye = np.mean(landmark_2d_106[[43, 48, 49, 51, 50]], axis=0)  # left eyebrow center
         pt_right_eye = np.mean(landmark_2d_106[101:106], axis=0)  # right eyebrow center
@@ -107,16 +109,29 @@ class VideoProcessor:
     def affine_transform_video(self, video_path):
         video_frames = read_video(video_path, change_fps=False)
         results = []
-        for frame in video_frames:
-            frame, _, _ = self.image_processor.affine_transform(frame)
-            results.append(frame)
+        valid_indices = []
+        skipped_count = 0
+        for i, frame in enumerate(video_frames):
+            result, _, _ = self.image_processor.affine_transform(frame)
+            if result is not None:
+                results.append(result)
+                valid_indices.append(i)
+            else:
+                skipped_count += 1
+
+        if len(results) == 0:
+            raise RuntimeError("No faces detected in any frame of the video")
+
+        if skipped_count > 0:
+            print(f"Skipping {skipped_count} frame(s) with no detected face. Only processing {len(results)} frames.")
+
         results = torch.stack(results)
 
         results = rearrange(results, "f c h w -> f h w c").numpy()
-        return results
+        return results, valid_indices
 
 
 if __name__ == "__main__":
     video_processor = VideoProcessor(256, "cuda")
-    video_frames = video_processor.affine_transform_video("assets/demo2_video.mp4")
+    video_frames, valid_indices = video_processor.affine_transform_video("assets/demo2_video.mp4")
     write_video("output.mp4", video_frames, fps=25)

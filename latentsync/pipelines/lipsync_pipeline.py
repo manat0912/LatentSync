@@ -254,61 +254,118 @@ class LipsyncPipeline(DiffusionPipeline):
         faces = []
         boxes = []
         affine_matrices = []
-        print(f"Affine transforming {len(video_frames)} faces...")
-        for frame in tqdm.tqdm(video_frames):
+        valid_indices = []
+        skipped_count = 0
+        print(f"Detecting faces in {len(video_frames)} frames...")
+        for i, frame in enumerate(tqdm.tqdm(video_frames)):
             face, box, affine_matrix = self.image_processor.affine_transform(frame)
-            faces.append(face)
-            boxes.append(box)
-            affine_matrices.append(affine_matrix)
+            if face is not None:
+                faces.append(face)
+                boxes.append(box)
+                affine_matrices.append(affine_matrix)
+                valid_indices.append(i)
+            else:
+                skipped_count += 1
+
+        if len(faces) == 0:
+            raise RuntimeError("No faces detected in any frame of the video")
+
+        if skipped_count > 0:
+            print(f"Skipping {skipped_count} frame(s) with no detected face. Only lip-syncing {len(faces)} frames.")
 
         faces = torch.stack(faces)
-        return faces, boxes, affine_matrices
+        return faces, boxes, affine_matrices, valid_indices
 
-    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list):
-        video_frames = video_frames[: len(faces)]
-        out_frames = []
-        print(f"Restoring {len(faces)} faces...")
-        for index, face in enumerate(tqdm.tqdm(faces)):
-            x1, y1, x2, y2 = boxes[index]
-            height = int(y2 - y1)
-            width = int(x2 - x1)
-            face = torchvision.transforms.functional.resize(
-                face, size=(height, width), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
-            )
-            out_frame = self.image_processor.restorer.restore_img(video_frames[index], face, affine_matrices[index])
-            out_frames.append(out_frame)
-        return np.stack(out_frames, axis=0)
+    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, valid_indices: list = None):
+        # If valid_indices is provided, restore only to those positions and keep originals elsewhere
+        if valid_indices is not None:
+            out_frames = video_frames.copy()
+            print(f"Restoring {len(faces)} faces to their original positions...")
+            for idx, face in enumerate(tqdm.tqdm(faces)):
+                original_idx = valid_indices[idx]
+                x1, y1, x2, y2 = boxes[idx]
+                height = int(y2 - y1)
+                width = int(x2 - x1)
+                face = torchvision.transforms.functional.resize(
+                    face, size=(height, width), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
+                )
+                out_frame = self.image_processor.restorer.restore_img(video_frames[original_idx], face, affine_matrices[idx])
+                out_frames[original_idx] = out_frame
+            return out_frames
+        else:
+            # Legacy behavior for backwards compatibility
+            video_frames = video_frames[: len(faces)]
+            out_frames = []
+            print(f"Restoring {len(faces)} faces...")
+            for index, face in enumerate(tqdm.tqdm(faces)):
+                x1, y1, x2, y2 = boxes[index]
+                height = int(y2 - y1)
+                width = int(x2 - x1)
+                face = torchvision.transforms.functional.resize(
+                    face, size=(height, width), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
+                )
+                out_frame = self.image_processor.restorer.restore_img(video_frames[index], face, affine_matrices[index])
+                out_frames.append(out_frame)
+            return np.stack(out_frames, axis=0)
 
     def loop_video(self, whisper_chunks: list, video_frames: np.ndarray):
         # If the audio is longer than the video, we need to loop the video
         if len(whisper_chunks) > len(video_frames):
-            faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
+            faces, boxes, affine_matrices, valid_indices = self.affine_transform_video(video_frames)
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
             loop_video_frames = []
             loop_faces = []
             loop_boxes = []
             loop_affine_matrices = []
+            loop_valid_indices = []
+            num_original_frames = len(video_frames)
             for i in range(num_loops):
+                offset = i * num_original_frames
                 if i % 2 == 0:
                     loop_video_frames.append(video_frames)
                     loop_faces.append(faces)
                     loop_boxes += boxes
                     loop_affine_matrices += affine_matrices
+                    loop_valid_indices += [idx + offset for idx in valid_indices]
                 else:
                     loop_video_frames.append(video_frames[::-1])
                     loop_faces.append(faces.flip(0))
                     loop_boxes += boxes[::-1]
                     loop_affine_matrices += affine_matrices[::-1]
+                    # Reverse the valid indices for the reversed video
+                    reversed_indices = [num_original_frames - 1 - idx for idx in valid_indices][::-1]
+                    loop_valid_indices += [idx + offset for idx in reversed_indices]
 
             video_frames = np.concatenate(loop_video_frames, axis=0)[: len(whisper_chunks)]
-            faces = torch.cat(loop_faces, dim=0)[: len(whisper_chunks)]
-            boxes = loop_boxes[: len(whisper_chunks)]
-            affine_matrices = loop_affine_matrices[: len(whisper_chunks)]
+            # Filter to only include valid data within the truncated range
+            valid_mask = [i < len(whisper_chunks) for i in loop_valid_indices]
+            faces_list = []
+            boxes_filtered = []
+            affine_matrices_filtered = []
+            valid_indices_filtered = []
+            face_idx = 0
+            for loop_idx in range(num_loops):
+                loop_face_count = len(valid_indices)
+                for j in range(loop_face_count):
+                    global_idx = loop_valid_indices[face_idx]
+                    if global_idx < len(whisper_chunks):
+                        if loop_idx % 2 == 0:
+                            faces_list.append(faces[j])
+                        else:
+                            faces_list.append(faces[len(valid_indices) - 1 - j])
+                        boxes_filtered.append(loop_boxes[face_idx])
+                        affine_matrices_filtered.append(loop_affine_matrices[face_idx])
+                        valid_indices_filtered.append(global_idx)
+                    face_idx += 1
+            faces = torch.stack(faces_list) if faces_list else faces
+            boxes = boxes_filtered
+            affine_matrices = affine_matrices_filtered
+            valid_indices = valid_indices_filtered
         else:
             video_frames = video_frames[: len(whisper_chunks)]
-            faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
+            faces, boxes, affine_matrices, valid_indices = self.affine_transform_video(video_frames)
 
-        return video_frames, faces, boxes, affine_matrices
+        return video_frames, faces, boxes, affine_matrices, valid_indices
 
     @torch.no_grad()
     def __call__(
@@ -368,15 +425,18 @@ class LipsyncPipeline(DiffusionPipeline):
         audio_samples = read_audio(audio_path)
         video_frames = read_video(video_path, use_decord=False)
 
-        video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+        video_frames, faces, boxes, affine_matrices, valid_indices = self.loop_video(whisper_chunks, video_frames)
+
+        # Select whisper chunks only for valid frame indices
+        valid_whisper_chunks = [whisper_chunks[idx] for idx in valid_indices]
 
         synced_video_frames = []
 
         num_channels_latents = self.vae.config.latent_channels
 
-        # Prepare latent variables
+        # Prepare latent variables for valid frames only
         all_latents = self.prepare_latents(
-            len(whisper_chunks),
+            len(valid_whisper_chunks),
             num_channels_latents,
             height,
             width,
@@ -385,10 +445,10 @@ class LipsyncPipeline(DiffusionPipeline):
             generator,
         )
 
-        num_inferences = math.ceil(len(whisper_chunks) / num_frames)
+        num_inferences = math.ceil(len(valid_whisper_chunks) / num_frames)
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
             if self.unet.add_audio_layer:
-                audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
+                audio_embeds = torch.stack(valid_whisper_chunks[i * num_frames : (i + 1) * num_frames])
                 audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
                 if do_classifier_free_guidance:
                     null_audio_embeds = torch.zeros_like(audio_embeds)
@@ -458,9 +518,9 @@ class LipsyncPipeline(DiffusionPipeline):
             )
             synced_video_frames.append(decoded_latents)
 
-        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
+        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices, valid_indices)
 
-        audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
+        audio_samples_remain_length = int(len(synced_video_frames) / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
 
         if is_train:
