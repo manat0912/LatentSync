@@ -31,6 +31,7 @@ import cv2
 from decord import AudioReader, VideoReader
 import shutil
 import subprocess
+import shlex
 
 
 # Machine epsilon for a float32 (single precision)
@@ -50,7 +51,7 @@ def read_video(video_path: str, change_fps=True, use_decord=True):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
         command = (
-            f"ffmpeg -loglevel error -y -nostdin -i {video_path} -r 25 -crf 18 {os.path.join(temp_dir, 'video.mp4')}"
+            f"ffmpeg -loglevel error -y -nostdin -i {shlex.quote(video_path)} -r 25 -crf 18 {shlex.quote(os.path.join(temp_dir, 'video.mp4'))}"
         )
         subprocess.run(command, shell=True)
         target_video_path = os.path.join(temp_dir, "video.mp4")
